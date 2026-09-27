@@ -3,6 +3,7 @@ package gmaps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -39,16 +40,93 @@ type photoBrowserState struct {
 	SeenTablists [][]string `json:"seen_tablists,omitempty"`
 }
 
+// Ordered most-to-least likely to open the tabbed album gallery. Hero-image
+// buttons come last: on many places they open the single-photo lightbox, which
+// has no album tablist, so they are only worth trying as a fallback.
 var photoEntrySelectors = []string{
 	`button[aria-label="See photos"]`,
-	`button[aria-label^="Photo of"]`,
-	`button[aria-label^="Photos of"]`,
 	`button[aria-label*="See photos"]`,
+	`a[aria-label*="See photos"]`,
+	`button[aria-label^="Photos of"]`,
+	`button.aoRNLd`,
+	`a[href*="/photo/"]`,
+	`button[aria-label^="Photo of"]`,
 	`button[jsaction*="pane.heroHeaderImage"]`,
 	`button[data-photo-index="0"]`,
-	`button.aoRNLd`,
-	`a[aria-label*="See photos"]`,
-	`a[href*="/photo/"]`,
+}
+
+// singlePhotoViewerMarker appears in the URL of Google's single-photo/pano
+// lightbox (/@lat,lng,3a,75y,90t/data=...), which never renders a tablist.
+const singlePhotoViewerMarker = ",3a,"
+
+const (
+	// singlePhotoConfirmPolls is ~1.5s at the 250ms photo-state poll interval.
+	singlePhotoConfirmPolls = 6
+
+	// photoViewerWaitPerAttempt bounds one entry-point candidate.
+	photoViewerWaitPerAttempt = 12 * time.Second
+
+	// maxPhotoEntryAttempts caps total clicking so a place whose every candidate
+	// misfires cannot stall the parent job.
+	maxPhotoEntryAttempts = 4
+
+	// photoEscapeWait bounds the back-out-of-the-lightbox recovery.
+	photoEscapeWait = 12 * time.Second
+)
+
+var errSinglePhotoViewer = errors.New("photo extractor: opened the single-photo viewer instead of the album gallery")
+
+func isSinglePhotoViewer(rawURL string) bool {
+	return strings.Contains(rawURL, singlePhotoViewerMarker)
+}
+
+// buildPhotoPanelURL mirrors buildReviewPanelURL, swapping the reviews marker
+// (!9m1!1b1) for the photos-tab marker (!10e5). Some place layouts expose no
+// gallery button at all, so navigating straight there is the only way in.
+func buildPhotoPanelURL(placeURL string, entry Entry) (string, error) {
+	placeMatch := placePathPattern.FindStringSubmatch(placeURL)
+	if len(placeMatch) < 2 {
+		return "", fmt.Errorf("could not extract place path from URL: %s", placeURL)
+	}
+
+	resourceMatch := resourceIDPattern.FindStringSubmatch(placeURL)
+	if len(resourceMatch) < 2 {
+		return "", fmt.Errorf("could not extract resource ID from URL: %s", placeURL)
+	}
+
+	dataID := entry.DataID
+	if dataID == "" {
+		var err error
+
+		dataID, err = extractPlaceID(placeURL)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	parsedURL, err := url.Parse(placeURL)
+	if err != nil {
+		return "", fmt.Errorf("parse place URL: %w", err)
+	}
+
+	language := parsedURL.Query().Get("hl")
+	if language == "" {
+		language = "en"
+	}
+
+	// The !4m7!3m6 prefixes are element counts: !10e5 is one element where the
+	// reviews marker (!9m1!1b1) is two, so they differ from buildReviewPanelURL.
+	return fmt.Sprintf(
+		"https://www.google.com/maps/place/%s/@%s,%s,16z/data=!4m7!3m6!1s%s!8m2!3d%s!4d%s!10e5!16s%s?hl=%s",
+		placeMatch[1],
+		formatCoordinate(entry.Latitude),
+		formatCoordinate(entry.Longtitude),
+		dataID,
+		formatCoordinate(entry.Latitude),
+		formatCoordinate(entry.Longtitude),
+		resourceMatch[1],
+		url.QueryEscape(language),
+	), nil
 }
 
 var photoBackSelectors = []string{
@@ -694,10 +772,16 @@ func orderPhotoTabs(labels []string) []string {
 	return append(ordered, deferred...)
 }
 
-func waitForPhotoViewer(ctx context.Context, page scrapemate.BrowserPage, timeout time.Duration) (scrapemate.BrowserPage, photoBrowserState, error) {
+func waitForPhotoViewer(
+	ctx context.Context,
+	page scrapemate.BrowserPage,
+	timeout time.Duration,
+	abortOnSinglePhoto bool,
+) (scrapemate.BrowserPage, photoBrowserState, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	var lastState photoBrowserState
+	singlePhotoPolls := 0
 
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
@@ -710,6 +794,17 @@ func waitForPhotoViewer(ctx context.Context, page scrapemate.BrowserPage, timeou
 			lastState = state
 			if len(state.TabLabels) > 0 {
 				return page, state, nil
+			}
+
+			// The single-photo lightbox will never grow a tablist, so stop early
+			// and let the caller try a different entry point.
+			if abortOnSinglePhoto && isSinglePhotoViewer(state.URL) {
+				singlePhotoPolls++
+				if singlePhotoPolls >= singlePhotoConfirmPolls {
+					return page, lastState, fmt.Errorf("%w (url=%s)", errSinglePhotoViewer, state.URL)
+				}
+			} else {
+				singlePhotoPolls = 0
 			}
 		} else {
 			lastErr = err
@@ -873,10 +968,139 @@ func closePhotoViewer(page scrapemate.BrowserPage) {
 	_, _ = clickFirstMatching(page, photoBackSelectors, 3*time.Second)
 }
 
+// openPhotoViewer clicks entry-point candidates until one lands on the tabbed
+// album gallery. A candidate that opens the single-photo lightbox is undone and
+// the next candidate is tried, because which button Google renders varies per
+// place and a wrong first click otherwise costs every album.
+func openPhotoViewer(ctx context.Context, page scrapemate.BrowserPage, photoURL string) (scrapemate.BrowserPage, photoBrowserState, error) {
+	placeURL := page.URL()
+
+	var (
+		lastErr  error
+		attempts int
+	)
+
+	for _, selector := range photoEntrySelectors {
+		if err := ctx.Err(); err != nil {
+			return page, photoBrowserState{}, err
+		}
+		if attempts >= maxPhotoEntryAttempts {
+			break
+		}
+
+		clicked, err := clickFirstMatching(page, []string{selector}, 5*time.Second)
+		if err != nil {
+			lastErr = fmt.Errorf("click %s: %w", selector, err)
+			continue
+		}
+		if !clicked {
+			continue
+		}
+
+		attempts++
+		page = bestEffortReattach(page)
+
+		var state photoBrowserState
+
+		page, state, err = waitForPhotoViewer(ctx, page, photoViewerWaitPerAttempt, true)
+		if err == nil {
+			return page, state, nil
+		}
+
+		if errors.Is(err, errSinglePhotoViewer) {
+			escapedPage, escapedState, escapeErr := escapeSinglePhotoViewer(ctx, page)
+			page = escapedPage
+
+			if escapeErr == nil {
+				return page, escapedState, nil
+			}
+
+			err = fmt.Errorf("%w; escape: %v", err, escapeErr)
+		}
+
+		lastErr = fmt.Errorf("%s: %w", selector, err)
+		page = restorePlacePage(page, placeURL)
+	}
+
+	// No button reached the gallery, so go straight to the photos tab.
+	if photoURL != "" {
+		if _, err := page.Goto(photoURL, scrapemate.WaitUntilDOMContentLoaded); err != nil {
+			lastErr = fmt.Errorf("open photo panel URL: %w", err)
+		} else {
+			page = bestEffortReattach(page)
+
+			nextPage, state, waitErr := waitForPhotoViewer(ctx, page, photoViewerWaitPerAttempt, true)
+			page = nextPage
+
+			if waitErr == nil {
+				return page, state, nil
+			}
+
+			if errors.Is(waitErr, errSinglePhotoViewer) {
+				escapedPage, escapedState, escapeErr := escapeSinglePhotoViewer(ctx, page)
+				page = escapedPage
+
+				if escapeErr == nil {
+					return page, escapedState, nil
+				}
+
+				waitErr = fmt.Errorf("%w; escape: %v", waitErr, escapeErr)
+			}
+
+			lastErr = fmt.Errorf("photo panel URL: %w", waitErr)
+		}
+	}
+
+	if attempts == 0 && lastErr == nil {
+		return page, photoBrowserState{}, fmt.Errorf("photo extractor: photo entry not found")
+	}
+
+	return page, photoBrowserState{}, lastErr
+}
+
+// escapeSinglePhotoViewer backs out of Google's single-photo lightbox, which in
+// the normal Maps flow lands on the album grid the lightbox was opened from.
+func escapeSinglePhotoViewer(ctx context.Context, page scrapemate.BrowserPage) (scrapemate.BrowserPage, photoBrowserState, error) {
+	page = bestEffortReattach(page)
+
+	clicked, err := clickFirstMatching(page, photoBackSelectors, 3*time.Second)
+	if err != nil {
+		return page, photoBrowserState{}, fmt.Errorf("leave single-photo viewer: %w", err)
+	}
+
+	if !clicked {
+		return page, photoBrowserState{}, fmt.Errorf("photo extractor: no back control in the single-photo viewer")
+	}
+
+	page = bestEffortReattach(page)
+
+	// No early abort here: the URL still reads as the lightbox for a moment after
+	// the back click, which would cut this recovery short.
+	return waitForPhotoViewer(ctx, page, photoEscapeWait, false)
+}
+
+// restorePlacePage undoes a wrong-viewer click so the next candidate starts
+// from the place panel again.
+func restorePlacePage(page scrapemate.BrowserPage, placeURL string) scrapemate.BrowserPage {
+	page = bestEffortReattach(page)
+	_, _ = clickFirstMatching(page, photoBackSelectors, 3*time.Second)
+	page = bestEffortReattach(page)
+
+	if placeURL == "" || !isSinglePhotoViewer(page.URL()) {
+		return page
+	}
+
+	if _, err := page.Goto(placeURL, scrapemate.WaitUntilDOMContentLoaded); err != nil {
+		return page
+	}
+
+	return bestEffortReattach(page)
+}
+
 // fetchPhotoAlbums runs the JS extractor against the open place page.
 // It is best-effort: on any error or unexpected shape it returns an empty
 // list rather than failing the parent place job.
-func fetchPhotoAlbums(ctx context.Context, page scrapemate.BrowserPage) ([]PhotoAlbum, error) {
+func fetchPhotoAlbums(ctx context.Context, page scrapemate.BrowserPage, photoURL string) ([]PhotoAlbum, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
@@ -886,18 +1110,9 @@ func fetchPhotoAlbums(ctx context.Context, page scrapemate.BrowserPage) ([]Photo
 	}
 
 	if len(state.TabLabels) == 0 {
-		clicked, clickErr := clickFirstMatching(page, photoEntrySelectors, 5*time.Second)
-		if clickErr != nil {
-			return nil, fmt.Errorf("open photo viewer click: %w", clickErr)
-		}
-		if !clicked {
-			return nil, fmt.Errorf("photo extractor: photo entry not found")
-		}
-
-		page = bestEffortReattach(page)
-		page, state, err = waitForPhotoViewer(ctx, page, 20*time.Second)
+		page, state, err = openPhotoViewer(ctx, page, photoURL)
 		if err != nil {
-			return nil, fmt.Errorf("wait for photo viewer: %w", err)
+			return nil, fmt.Errorf("open photo viewer: %w", err)
 		}
 	}
 

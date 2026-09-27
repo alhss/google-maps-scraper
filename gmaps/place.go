@@ -197,11 +197,31 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
 	resp.Meta["json"] = raw
 
 	if j.ExtractExtraPhotos {
-		albums, err := fetchPhotoAlbums(ctx, page)
+		photoURL := ""
+
+		if photoEntry, parseErr := EntryFromJSON(raw); parseErr == nil {
+			if built, buildErr := buildPhotoPanelURL(placeURL, photoEntry); buildErr == nil {
+				photoURL = built
+			}
+		}
+
+		albums, err := fetchPhotoAlbums(ctx, page, photoURL)
 		if err != nil {
 			fmt.Printf("Warning: photo album extraction failed: %v\n", err)
 		} else if len(albums) > 0 {
 			resp.Meta["photo_albums"] = albums
+		}
+
+		// Photo extraction leaves the browser on a gallery/lightbox URL. The DOM
+		// review fallback scrapes whatever page is currently open, so it must be
+		// sent back to the place panel first.
+		if j.ExtractExtraReviews && page.URL() != placeURL {
+			if _, err := page.Goto(placeURL, scrapemate.WaitUntilDOMContentLoaded); err != nil {
+				fmt.Printf("Warning: returning to place page after photos failed: %v\n", err)
+			} else {
+				clickRejectCookiesIfRequired(page)
+				_ = page.WaitForURL(page.URL(), defaultTimeout)
+			}
 		}
 	}
 

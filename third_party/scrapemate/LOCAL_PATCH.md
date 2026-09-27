@@ -1,9 +1,6 @@
 # Local Scrapemate patch
 
-This directory contains the production packages imported from
-`github.com/gosom/scrapemate` v1.2.1. Upstream tests, CI configuration,
-commands, mocks, and documentation are omitted because this is a local module
-replacement rather than a standalone Scrapemate checkout.
+This directory is a copy of `github.com/gosom/scrapemate` v1.2.1.
 
 The only intentional functional difference is that
 `adapters/fetchers/jshttp/jshttp.go` does not pass Chromium's
