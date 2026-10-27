@@ -3,6 +3,7 @@ package gmaps
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -204,6 +205,10 @@ func (j *GmapJob) Process(ctx context.Context, resp *scrapemate.Response) (any, 
 func (j *GmapJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPage) scrapemate.Response {
 	var resp scrapemate.Response
 
+	if err := injectGoogleCookies(page); err != nil {
+		log.Printf("google cookies not applied: %v", err)
+	}
+
 	pageResponse, err := page.Goto(j.GetFullURL(), scrapemate.WaitUntilDOMContentLoaded)
 	if err != nil {
 		resp.Error = err
@@ -239,7 +244,10 @@ func (j *GmapJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPag
 		waitCancel()
 	}
 
-	if singlePlace {
+	// No results feed and no redirect to a place (e.g. "Google Maps can't
+	// find ..."): return the page as-is so Process reports zero places
+	// instead of failing the job in scroll().
+	if singlePlace || err != nil {
 		resp.URL = page.URL()
 
 		var body string
@@ -323,6 +331,9 @@ func scroll(ctx context.Context,
 ) (int, error) {
 	expr := `async () => {
 		const el = document.querySelector("` + scrollSelector + `");
+		if (!el) {
+			return 0;
+		}
 		el.scrollTop = el.scrollHeight;
 
 		return new Promise((resolve, reject) => {

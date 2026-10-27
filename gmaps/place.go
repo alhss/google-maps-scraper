@@ -164,6 +164,10 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
 func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPage) scrapemate.Response {
 	var resp scrapemate.Response
 
+	if err := injectGoogleCookies(page); err != nil {
+		fmt.Printf("Warning: google cookies not applied: %v\n", err)
+	}
+
 	pageResponse, err := page.Goto(j.GetURL(), scrapemate.WaitUntilDOMContentLoaded)
 	if err != nil {
 		resp.Error = err

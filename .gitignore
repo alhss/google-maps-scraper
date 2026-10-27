@@ -1,6 +1,8 @@
 cache/
 vendor
 bin
+# Exported signed-in Google session: a live login, never commit.
+google-cookies.json
 webdata/
 examples/examples-api/map-outputs
 examples/examples-api/**/__pycache__/

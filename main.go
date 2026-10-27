@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/gosom/google-maps-scraper/gmaps"
 	"github.com/gosom/google-maps-scraper/runner"
 	"github.com/gosom/google-maps-scraper/runner/databaserunner"
 	"github.com/gosom/google-maps-scraper/runner/filerunner"
@@ -34,6 +35,22 @@ func main() {
 	}()
 
 	cfg := runner.ParseConfig()
+
+	if cfg.GoogleCookies != "" {
+		cookies, err := gmaps.LoadGoogleCookies(cfg.GoogleCookies)
+		if err != nil {
+			cancel()
+			os.Stderr.WriteString("google cookies: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+
+		gmaps.SetGoogleCookies(cookies)
+		log.Printf("Loaded %d Google cookies from %s", len(cookies), cfg.GoogleCookies)
+
+		if missing := gmaps.MissingAuthCookies(cookies); len(missing) > 0 {
+			log.Printf("Warning: cookie export is missing sign-in cookies %v; Maps may stay in limited view", missing)
+		}
+	}
 
 	runnerInstance, err := runnerFactory(cfg)
 	if err != nil {

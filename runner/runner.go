@@ -85,6 +85,8 @@ type Config struct {
 	LeadsDBAPIKey            string
 	BrowserPoolSize          int
 	MaxPagesPerBrowser       int
+	// Exported signed-in Google cookies; avoids Maps' signed-out "limited view".
+	GoogleCookies string
 
 	// Grid scraping — divide a bounding box into cells to bypass the ~120
 	// results-per-search limit imposed by Google Maps.
@@ -144,6 +146,7 @@ func ParseConfig() *Config {
 	flag.Float64Var(&cfg.GridCellKm, "grid-cell", 1.0, "grid cell size in km [default: 1.0]. Use with -grid-bbox")
 	flag.IntVar(&cfg.BrowserPoolSize, "browser-pool-size", 0, "number of browser contexts for JS mode; 0 derives from concurrency and pages-per-browser")
 	flag.IntVar(&cfg.MaxPagesPerBrowser, "pages-per-browser", 1, "maximum concurrent pages per browser context in JS mode")
+	flag.StringVar(&cfg.GoogleCookies, "google-cookies", "", "path to exported signed-in google.com cookies (Cookie-Editor JSON, Playwright storageState, or cookies.txt)")
 	flag.BoolVar(&cfg.Version, "version", false, "returns the version of the tool")
 
 	flag.Parse()
